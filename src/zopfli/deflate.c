@@ -98,6 +98,11 @@ static void PatchDistanceCodesForBuggyDecoders(unsigned* d_lengths) {
   }
 }
 
+/* The order in which code length code lengths are encoded as per deflate. */
+static const unsigned order[19] = {
+  16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+};
+
 /*
 Encodes the Huffman tree and returns how many bits its encoding takes. If out
 is a null pointer, only returns the size and runs faster.
@@ -121,10 +126,6 @@ static size_t EncodeTree(const unsigned* ll_lengths,
   size_t clcounts[19];
   unsigned clcl[19];  /* Code length code lengths. */
   unsigned clsymbols[19];
-  /* The order in which code length code lengths are encoded as per deflate. */
-  static const unsigned order[19] = {
-    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
-  };
   int size_only = !out;
   size_t result_size = 0;
 
@@ -248,24 +249,125 @@ static size_t EncodeTree(const unsigned* ll_lengths,
   return result_size;
 }
 
+/*
+Finds which of the 8 combinations of the use_16, use_17 and use_18 options of
+EncodeTree gives the smallest tree encoding, the first one if several do.
+Returns that combination and outputs its size. Gives the same sizes as
+EncodeTree with out set to null, but splits the code lengths into runs only
+once, and computes the code length code lengths only once for combinations
+that give the same code length code histogram.
+*/
+static int FindBestTreeEncoding(const unsigned* ll_lengths,
+                                const unsigned* d_lengths, size_t* bestsize) {
+  unsigned hlit = 29;  /* 286 - 257 */
+  unsigned hdist = 29;  /* 32 - 1, but gzip does not like hdist > 29.*/
+  unsigned hlit2, lld_total;
+  /* Runs of identical code lengths. */
+  unsigned char runsymbol[ZOPFLI_NUM_LL + ZOPFLI_NUM_D];
+  unsigned runlength[ZOPFLI_NUM_LL + ZOPFLI_NUM_D];
+  size_t numruns = 0;
+  size_t counts[8][19];
+  size_t sizes[8];
+  size_t i, r;
+  int v, k;
+  int best = 0;
+
+  /* Trim zeros. */
+  while (hlit > 0 && ll_lengths[257 + hlit - 1] == 0) hlit--;
+  while (hdist > 0 && d_lengths[1 + hdist - 1] == 0) hdist--;
+  hlit2 = hlit + 257;
+  lld_total = hlit2 + hdist + 1;
+
+  for (i = 0; i < lld_total; i++) {
+    unsigned char symbol = i < hlit2 ? ll_lengths[i] : d_lengths[i - hlit2];
+    if (numruns > 0 && runsymbol[numruns - 1] == symbol) {
+      runlength[numruns - 1]++;
+    } else {
+      runsymbol[numruns] = symbol;
+      runlength[numruns] = 1;
+      numruns++;
+    }
+  }
+
+  for (v = 0; v < 8; v++) {
+    int use_16 = v & 1, use_17 = v & 2, use_18 = v & 4;
+    size_t* clcounts = counts[v];
+    for (i = 0; i < 19; i++) clcounts[i] = 0;
+    for (r = 0; r < numruns; r++) {
+      unsigned symbol = runsymbol[r];
+      unsigned count = runlength[r];
+      if (!(use_16 || (symbol == 0 && (use_17 || use_18)))) {
+        /* Every code length is encoded on its own. */
+        clcounts[symbol] += count;
+        continue;
+      }
+      /* Repetitions of zeroes */
+      if (symbol == 0 && count >= 3) {
+        if (use_18) {
+          while (count >= 11) {
+            unsigned count2 = count > 138 ? 138 : count;
+            clcounts[18]++;
+            count -= count2;
+          }
+        }
+        if (use_17) {
+          while (count >= 3) {
+            unsigned count2 = count > 10 ? 10 : count;
+            clcounts[17]++;
+            count -= count2;
+          }
+        }
+      }
+      /* Repetitions of any symbol */
+      if (use_16 && count >= 4) {
+        count--;  /* Since the first one is hardcoded. */
+        clcounts[symbol]++;
+        while (count >= 3) {
+          unsigned count2 = count > 6 ? 6 : count;
+          clcounts[16]++;
+          count -= count2;
+        }
+      }
+      /* No or insufficient repetition */
+      clcounts[symbol] += count;
+    }
+
+    for (k = 0; k < v; k++) {
+      if (!memcmp(counts[k], clcounts, sizeof(counts[k]))) break;
+    }
+    if (k < v) {
+      sizes[v] = sizes[k];
+    } else {
+      unsigned clcl[19];
+      unsigned hclen = 15;
+      size_t size = 0;
+      ZopfliCalculateBitLengths(clcounts, 19, 7, clcl);
+      /* Trim zeros. */
+      while (hclen > 0 && clcounts[order[hclen + 4 - 1]] == 0) hclen--;
+      size += 14;  /* hlit, hdist, hclen bits */
+      size += (hclen + 4) * 3;  /* clcl bits */
+      for (i = 0; i < 19; i++) size += clcl[i] * clcounts[i];
+      /* Extra bits. */
+      size += clcounts[16] * 2;
+      size += clcounts[17] * 3;
+      size += clcounts[18] * 7;
+      sizes[v] = size;
+    }
+    if (v == 0 || sizes[v] < sizes[best]) best = v;
+    /* Must stay in sync with the encoding EncodeTree actually writes. */
+    assert(sizes[v] == EncodeTree(ll_lengths, d_lengths,
+                                  use_16, use_17, use_18, 0, 0, 0));
+  }
+  *bestsize = sizes[best];
+  return best;
+}
+
 static void AddDynamicTree(const unsigned* ll_lengths,
                            const unsigned* d_lengths,
                            unsigned char* bp,
                            unsigned char** out, size_t* outsize) {
-  int i;
-  int best = 0;
-  size_t bestsize = 0;
-
-  for(i = 0; i < 8; i++) {
-    size_t size = EncodeTree(ll_lengths, d_lengths,
-                             i & 1, i & 2, i & 4,
-                             0, 0, 0);
-    if (bestsize == 0 || size < bestsize) {
-      bestsize = size;
-      best = i;
-    }
-  }
-
+  size_t bestsize;
+  int best = FindBestTreeEncoding(ll_lengths, d_lengths, &bestsize);
   EncodeTree(ll_lengths, d_lengths,
              best & 1, best & 2, best & 4,
              bp, out, outsize);
@@ -276,16 +378,8 @@ Gives the exact size of the tree, in bits, as it will be encoded in DEFLATE.
 */
 static size_t CalculateTreeSize(const unsigned* ll_lengths,
                                 const unsigned* d_lengths) {
-  size_t result = 0;
-  int i;
-
-  for(i = 0; i < 8; i++) {
-    size_t size = EncodeTree(ll_lengths, d_lengths,
-                             i & 1, i & 2, i & 4,
-                             0, 0, 0);
-    if (result == 0 || size < result) result = size;
-  }
-
+  size_t result;
+  FindBestTreeEncoding(ll_lengths, d_lengths, &result);
   return result;
 }
 

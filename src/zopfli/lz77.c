@@ -35,6 +35,7 @@ void ZopfliInitLZ77Store(const unsigned char* data, ZopfliLZ77Store* store) {
   store->d_symbol = 0;
   store->ll_counts = 0;
   store->d_counts = 0;
+  store->capacity = 0;
 }
 
 void ZopfliCleanLZ77Store(ZopfliLZ77Store* store) {
@@ -51,44 +52,58 @@ static size_t CeilDiv(size_t a, size_t b) {
   return (a + b - 1) / b;
 }
 
-void ZopfliCopyLZ77Store(
-    const ZopfliLZ77Store* source, ZopfliLZ77Store* dest) {
-  size_t i;
-  size_t llsize = ZOPFLI_NUM_LL * CeilDiv(source->size, ZOPFLI_NUM_LL);
-  size_t dsize = ZOPFLI_NUM_D * CeilDiv(source->size, ZOPFLI_NUM_D);
-  ZopfliCleanLZ77Store(dest);
-  ZopfliInitLZ77Store(source->data, dest);
-  dest->litlens =
-      (unsigned short*)malloc(sizeof(*dest->litlens) * source->size);
-  dest->dists = (unsigned short*)malloc(sizeof(*dest->dists) * source->size);
-  dest->pos = (size_t*)malloc(sizeof(*dest->pos) * source->size);
-  dest->ll_symbol =
-      (unsigned short*)malloc(sizeof(*dest->ll_symbol) * source->size);
-  dest->d_symbol =
-      (unsigned short*)malloc(sizeof(*dest->d_symbol) * source->size);
-  dest->ll_counts = (size_t*)malloc(sizeof(*dest->ll_counts) * llsize);
-  dest->d_counts = (size_t*)malloc(sizeof(*dest->d_counts) * dsize);
+void ZopfliClearLZ77Store(ZopfliLZ77Store* store) {
+  store->size = 0;
+}
+
+/* Resizes the arrays to have room for capacity LZ77 symbols. */
+static void ResizeLZ77Store(ZopfliLZ77Store* store, size_t capacity) {
+  size_t llsize = ZOPFLI_NUM_LL * CeilDiv(capacity, ZOPFLI_NUM_LL);
+  size_t dsize = ZOPFLI_NUM_D * CeilDiv(capacity, ZOPFLI_NUM_D);
+  store->litlens = (unsigned short*)realloc(store->litlens,
+      sizeof(*store->litlens) * capacity);
+  store->dists = (unsigned short*)realloc(store->dists,
+      sizeof(*store->dists) * capacity);
+  store->pos = (size_t*)realloc(store->pos, sizeof(*store->pos) * capacity);
+  store->ll_symbol = (unsigned short*)realloc(store->ll_symbol,
+      sizeof(*store->ll_symbol) * capacity);
+  store->d_symbol = (unsigned short*)realloc(store->d_symbol,
+      sizeof(*store->d_symbol) * capacity);
+  store->ll_counts = (size_t*)realloc(store->ll_counts,
+      sizeof(*store->ll_counts) * llsize);
+  store->d_counts = (size_t*)realloc(store->d_counts,
+      sizeof(*store->d_counts) * dsize);
 
   /* Allocation failed. */
-  if (!dest->litlens || !dest->dists) exit(-1);
-  if (!dest->pos) exit(-1);
-  if (!dest->ll_symbol || !dest->d_symbol) exit(-1);
-  if (!dest->ll_counts || !dest->d_counts) exit(-1);
+  if (!store->litlens || !store->dists) exit(-1);
+  if (!store->pos) exit(-1);
+  if (!store->ll_symbol || !store->d_symbol) exit(-1);
+  if (!store->ll_counts || !store->d_counts) exit(-1);
 
-  dest->size = source->size;
-  for (i = 0; i < source->size; i++) {
-    dest->litlens[i] = source->litlens[i];
-    dest->dists[i] = source->dists[i];
-    dest->pos[i] = source->pos[i];
-    dest->ll_symbol[i] = source->ll_symbol[i];
-    dest->d_symbol[i] = source->d_symbol[i];
+  store->capacity = capacity;
+}
+
+void ZopfliCopyLZ77Store(
+    const ZopfliLZ77Store* source, ZopfliLZ77Store* dest) {
+  size_t llsize = ZOPFLI_NUM_LL * CeilDiv(source->size, ZOPFLI_NUM_LL);
+  size_t dsize = ZOPFLI_NUM_D * CeilDiv(source->size, ZOPFLI_NUM_D);
+  size_t size = source->size;
+  if (dest->capacity < size) {
+    /* The old content does not need to be kept. */
+    ZopfliCleanLZ77Store(dest);
+    ZopfliInitLZ77Store(source->data, dest);
+    ResizeLZ77Store(dest, size);
   }
-  for (i = 0; i < llsize; i++) {
-    dest->ll_counts[i] = source->ll_counts[i];
-  }
-  for (i = 0; i < dsize; i++) {
-    dest->d_counts[i] = source->d_counts[i];
-  }
+  dest->data = source->data;
+  dest->size = size;
+  if (size == 0) return;
+  memcpy(dest->litlens, source->litlens, sizeof(*dest->litlens) * size);
+  memcpy(dest->dists, source->dists, sizeof(*dest->dists) * size);
+  memcpy(dest->pos, source->pos, sizeof(*dest->pos) * size);
+  memcpy(dest->ll_symbol, source->ll_symbol, sizeof(*dest->ll_symbol) * size);
+  memcpy(dest->d_symbol, source->d_symbol, sizeof(*dest->d_symbol) * size);
+  memcpy(dest->ll_counts, source->ll_counts, sizeof(*dest->ll_counts) * llsize);
+  memcpy(dest->d_counts, source->d_counts, sizeof(*dest->d_counts) * dsize);
 }
 
 /*
@@ -98,54 +113,48 @@ context must be a ZopfliLZ77Store*.
 void ZopfliStoreLitLenDist(unsigned short length, unsigned short dist,
                            size_t pos, ZopfliLZ77Store* store) {
   size_t i;
-  /* Needed for using ZOPFLI_APPEND_DATA multiple times. */
   size_t origsize = store->size;
   size_t llstart = ZOPFLI_NUM_LL * (origsize / ZOPFLI_NUM_LL);
   size_t dstart = ZOPFLI_NUM_D * (origsize / ZOPFLI_NUM_D);
+
+  if (origsize == store->capacity) {
+    /* Double the room, so that appending takes amortized constant time. */
+    ResizeLZ77Store(store, origsize == 0 ? 1024 : origsize * 2);
+  }
 
   /* Everytime the index wraps around, a new cumulative histogram is made: we're
   keeping one histogram value per LZ77 symbol rather than a full histogram for
   each to save memory. */
   if (origsize % ZOPFLI_NUM_LL == 0) {
-    size_t llsize = origsize;
     for (i = 0; i < ZOPFLI_NUM_LL; i++) {
-      ZOPFLI_APPEND_DATA(
-          origsize == 0 ? 0 : store->ll_counts[origsize - ZOPFLI_NUM_LL + i],
-          &store->ll_counts, &llsize);
+      store->ll_counts[origsize + i] =
+          origsize == 0 ? 0 : store->ll_counts[origsize - ZOPFLI_NUM_LL + i];
     }
   }
   if (origsize % ZOPFLI_NUM_D == 0) {
-    size_t dsize = origsize;
     for (i = 0; i < ZOPFLI_NUM_D; i++) {
-      ZOPFLI_APPEND_DATA(
-          origsize == 0 ? 0 : store->d_counts[origsize - ZOPFLI_NUM_D + i],
-          &store->d_counts, &dsize);
+      store->d_counts[origsize + i] =
+          origsize == 0 ? 0 : store->d_counts[origsize - ZOPFLI_NUM_D + i];
     }
   }
 
-  ZOPFLI_APPEND_DATA(length, &store->litlens, &store->size);
-  store->size = origsize;
-  ZOPFLI_APPEND_DATA(dist, &store->dists, &store->size);
-  store->size = origsize;
-  ZOPFLI_APPEND_DATA(pos, &store->pos, &store->size);
   assert(length < 259);
-
+  store->litlens[origsize] = length;
+  store->dists[origsize] = dist;
+  store->pos[origsize] = pos;
   if (dist == 0) {
-    store->size = origsize;
-    ZOPFLI_APPEND_DATA(length, &store->ll_symbol, &store->size);
-    store->size = origsize;
-    ZOPFLI_APPEND_DATA(0, &store->d_symbol, &store->size);
+    store->ll_symbol[origsize] = length;
+    store->d_symbol[origsize] = 0;
     store->ll_counts[llstart + length]++;
   } else {
-    store->size = origsize;
-    ZOPFLI_APPEND_DATA(ZopfliGetLengthSymbol(length),
-                       &store->ll_symbol, &store->size);
-    store->size = origsize;
-    ZOPFLI_APPEND_DATA(ZopfliGetDistSymbol(dist),
-                       &store->d_symbol, &store->size);
-    store->ll_counts[llstart + ZopfliGetLengthSymbol(length)]++;
-    store->d_counts[dstart + ZopfliGetDistSymbol(dist)]++;
+    unsigned short lsym = (unsigned short)ZopfliGetLengthSymbol(length);
+    unsigned short dsym = (unsigned short)ZopfliGetDistSymbol(dist);
+    store->ll_symbol[origsize] = lsym;
+    store->d_symbol[origsize] = dsym;
+    store->ll_counts[llstart + lsym]++;
+    store->d_counts[dstart + dsym]++;
   }
+  store->size = origsize + 1;
 }
 
 void ZopfliAppendLZ77Store(const ZopfliLZ77Store* store,
@@ -404,6 +413,12 @@ static void StoreInLongestMatchCache(ZopfliBlockState* s,
 }
 #endif
 
+static unsigned Load16(const unsigned char* p) {
+  unsigned short v;
+  memcpy(&v, p, 2);
+  return v;
+}
+
 void ZopfliFindLongestMatch(ZopfliBlockState* s, const ZopfliHash* h,
     const unsigned char* array,
     size_t pos, size_t size, size_t limit,
@@ -415,6 +430,9 @@ void ZopfliFindLongestMatch(ZopfliBlockState* s, const ZopfliHash* h,
   const unsigned char* match;
   const unsigned char* arrayend;
   const unsigned char* arrayend_safe;
+#ifdef ZOPFLI_HASH_SAME
+  unsigned short same0;  /* Repetitions of the same byte after pos. */
+#endif
 #if ZOPFLI_MAX_CHAIN_HITS < ZOPFLI_WINDOW_SIZE
   int chain_counter = ZOPFLI_MAX_CHAIN_HITS;  /* For quitting early. */
 #endif
@@ -460,37 +478,40 @@ void ZopfliFindLongestMatch(ZopfliBlockState* s, const ZopfliHash* h,
 
   dist = p < pp ? pp - p : ((ZOPFLI_WINDOW_SIZE - p) + pp);
 
+  scan = &array[pos];
+#ifdef ZOPFLI_HASH_SAME
+  same0 = h->same[hpos];
+#endif
+
   /* Go through all distances. */
   while (dist < ZOPFLI_WINDOW_SIZE) {
-    unsigned short currentlength = 0;
-
     assert(p < ZOPFLI_WINDOW_SIZE);
     assert(p == hprev[pp]);
     assert(hhashval[p] == hval);
+    /* dist is never 0: it starts and grows by at least 1. */
+    assert(dist > 0);
+    assert(dist <= pos);
+    match = scan - dist;
 
-    if (dist > 0) {
-      assert(pos < size);
-      assert(dist <= pos);
-      scan = &array[pos];
-      match = &array[pos - dist];
-
-      /* Testing the byte at position bestlength first, goes slightly faster. */
-      if (pos + bestlength >= size
-          || *(scan + bestlength) == *(match + bestlength)) {
-
+    /* Testing the bytes at positions bestlength - 1 and bestlength first,
+    goes faster: the match can only be longer if they are equal. They are
+    always within the array, since 1 <= bestlength < limit <= size - pos. */
+    if (Load16(scan + bestlength - 1) == Load16(match + bestlength - 1)) {
+      const unsigned char* end;
+      unsigned short currentlength;
 #ifdef ZOPFLI_HASH_SAME
-        unsigned short same0 = h->same[pos & ZOPFLI_WINDOW_MASK];
-        if (same0 > 2 && *scan == *match) {
-          unsigned short same1 = h->same[(pos - dist) & ZOPFLI_WINDOW_MASK];
-          unsigned short same = same0 < same1 ? same0 : same1;
-          if (same > limit) same = limit;
-          scan += same;
-          match += same;
-        }
-#endif
-        scan = GetMatch(scan, match, arrayend, arrayend_safe);
-        currentlength = scan - &array[pos];  /* The found length. */
+      if (same0 > 2 && *scan == *match) {
+        unsigned short same1 = h->same[(pos - dist) & ZOPFLI_WINDOW_MASK];
+        unsigned short same = same0 < same1 ? same0 : same1;
+        if (same > limit) same = limit;
+        end = GetMatch(scan + same, match + same, arrayend, arrayend_safe);
+      } else {
+        end = GetMatch(scan, match, arrayend, arrayend_safe);
       }
+#else
+      end = GetMatch(scan, match, arrayend, arrayend_safe);
+#endif
+      currentlength = end - scan;  /* The found length. */
 
       if (currentlength > bestlength) {
         if (sublen) {
@@ -505,10 +526,9 @@ void ZopfliFindLongestMatch(ZopfliBlockState* s, const ZopfliHash* h,
       }
     }
 
-
 #ifdef ZOPFLI_HASH_SAME_HASH
     /* Switch to the other hash once this will be more efficient. */
-    if (hhead != h->head2 && bestlength >= h->same[hpos] &&
+    if (hhead != h->head2 && bestlength >= same0 &&
         h->val2 == h->hashval2[p]) {
       /* Now use the hash that encodes the length and first byte. */
       hhead = h->head2;
@@ -522,7 +542,7 @@ void ZopfliFindLongestMatch(ZopfliBlockState* s, const ZopfliHash* h,
     p = hprev[p];
     if (p == pp) break;  /* Uninited prev value. */
 
-    dist += p < pp ? pp - p : ((ZOPFLI_WINDOW_SIZE - p) + pp);
+    dist += (pp - p) & ZOPFLI_WINDOW_MASK;  /* p != pp, so at least 1. */
 
 #if ZOPFLI_MAX_CHAIN_HITS < ZOPFLI_WINDOW_SIZE
     chain_counter--;

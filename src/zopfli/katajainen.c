@@ -28,161 +28,190 @@ Jyrki Katajainen, Alistair Moffat, Andrew Turpin".
 #include <stdlib.h>
 #include <limits.h>
 
-typedef struct Node Node;
+/* Alphabets up to this size and code length use memory on the stack. */
+#define SMALL_ALPHABET 32
+#define SMALL_MAXBITS 15
 
 /*
-Nodes forming chains. Also used to represent leaves.
+A leaf: one symbol with its weight (frequency).
 */
-struct Node {
-  size_t weight;  /* Total weight (symbol count) of this chain. */
-  Node* tail;  /* Previous node(s) of this chain, or 0 if none. */
-  int count;  /* Leaf symbol index, or number of leaves before this chain. */
-};
+typedef struct Node {
+  size_t weight;  /* Symbol count. */
+  int count;  /* Index of the symbol this leaf represents. */
+} Node;
 
 /*
-Memory pool for nodes.
-*/
-typedef struct NodePool {
-  Node* next;  /* Pointer to a free node in the pool. */
-} NodePool;
+Computes the length limited code lengths with the package-merge algorithm.
+leaves: the used symbols, sorted from lightest to heaviest.
+numsymbols: amount of leaves, at least 3.
+maxbits: the maximum code length, at most numsymbols - 1, and with
+    (1 << maxbits) >= numsymbols.
+bitlengths: receives the code lengths, must be initialized to 0.
 
-/*
-Initializes a chain node with the given values and marks it as in use.
+List 0 holds the leaves. List i merges the leaves with the packages of list
+i - 1, the sums of its consecutive pairs of items, a package going before a leaf
+of equal weight. The first 2 * numsymbols - 2 items of the last list are
+selected, and the selected packages of each list select twice as many items of
+the list before. The code length of a leaf is the number of lists in which it
+is selected. This builds the lists completely with plain arrays, giving the
+same result as the boundary package-merge of the paper, which creates only the
+needed parts of the lists lazily with a recursion over linked chains, but
+mispredicts many more branches doing so.
 */
-static void InitNode(size_t weight, int count, Node* tail, Node* node) {
-  node->weight = weight;
-  node->count = count;
-  node->tail = tail;
+static void PackageMerge(const Node* leaves, int numsymbols, int maxbits,
+                         unsigned* bitlengths) {
+  /* Every list has fewer items than this. */
+  int maxlen = 2 * numsymbols;
+  /* Size of the weight arrays below, and of numleaves. */
+  size_t bufsize = 4 * maxlen + 4;
+  size_t nlsize = maxbits * (maxlen + 1);
+  /* For small alphabets, such as the 19 code length codes, the memory is on
+  the stack, since this is called very often. */
+  size_t localbuffer[4 * 2 * SMALL_ALPHABET + 4];
+  int localnumleaves[SMALL_MAXBITS * (2 * SMALL_ALPHABET + 1)];
+  int small = numsymbols <= SMALL_ALPHABET && maxbits <= SMALL_MAXBITS;
+  /* The leaf weights and the package weights of the previous list, each with a
+  sentinel before and after, and the previous and current list. */
+  size_t* buffer = small ? localbuffer
+      : (size_t*)malloc(bufsize * sizeof(size_t) + nlsize * sizeof(int));
+  size_t* weights = buffer + 1;
+  size_t* packages = weights + maxlen + 2;
+  size_t* prev = packages + maxlen + 1;
+  size_t* cur = prev + maxlen;
+  /* numleaves[i * (maxlen + 1) + t]: amount of leaves among the first t items
+  of list i. */
+  int* numleaves = small ? localnumleaves : (int*)(buffer + bufsize);
+  int prevlen, i, t;
+  int selected;
+
+  if (!buffer) exit(-1);  /* Allocation failed. */
+
+  for (t = 0; t < numsymbols; t++) weights[t] = leaves[t].weight;
+  /* Sentinels, lighter and heavier than any real weight (which are nonzero
+  and far below the maximum), so that the merges below never take a leaf or
+  package past either end. */
+  weights[-1] = 0;
+  weights[numsymbols] = (size_t)(-1);
+  packages[-1] = 0;
+  for (t = 0; t < numsymbols; t++) prev[t] = weights[t];
+  for (t = 0; t <= numsymbols; t++) numleaves[t] = t;
+  prevlen = numsymbols;
+
+  for (i = 1; i < maxbits; i++) {
+    int* nl = numleaves + i * (maxlen + 1);
+    int numpackages = prevlen / 2;
+    int total = numsymbols + numpackages;
+    int half = (total + 1) / 2;
+    int leaf = 0, package = 0;  /* Next ones from the front. */
+    int leafback = numsymbols - 1, packageback = numpackages - 1;
+    size_t* swap;
+    for (t = 0; t < numpackages; t++) {
+      packages[t] = prev[2 * t] + prev[2 * t + 1];
+    }
+    packages[numpackages] = (size_t)(-1);
+    nl[0] = 0;
+    nl[total] = numsymbols;
+    /* Merge without branches, since which one comes next is unpredictable,
+    from both ends at once, since each step depends on the previous one. From
+    the front, a package goes before a leaf of equal weight, so from the back
+    the leaf goes first. Both halves meet exactly in the middle. */
+    for (t = 0; t < total - half; t++) {
+      size_t p = packages[package];
+      size_t l = weights[leaf];
+      int takepackage = p <= l;
+      size_t pb = packages[packageback];
+      size_t lb = weights[leafback];
+      int takepackageback = pb > lb;
+      int tb = total - 1 - t;
+      cur[t] = takepackage ? p : l;
+      package += takepackage;
+      leaf += 1 - takepackage;
+      nl[t + 1] = leaf;
+      cur[tb] = takepackageback ? pb : lb;
+      packageback -= takepackageback;
+      leafback -= 1 - takepackageback;
+      nl[tb] = leafback + 1;
+    }
+    if (half > total - half) {
+      /* The middle item, when the total is odd. */
+      size_t p = packages[package];
+      size_t l = weights[leaf];
+      int takepackage = p <= l;
+      cur[t] = takepackage ? p : l;
+      leaf += 1 - takepackage;
+      nl[t + 1] = leaf;
+    }
+    swap = prev;
+    prev = cur;
+    cur = swap;
+    prevlen = total;
+  }
+
+  selected = 2 * numsymbols - 2;
+  for (i = maxbits - 1; i >= 0; i--) {
+    int c = numleaves[i * (maxlen + 1) + selected];
+    for (t = 0; t < c; t++) bitlengths[leaves[t].count]++;
+    selected = 2 * (selected - c);
+  }
+
+  if (!small) free(buffer);
 }
 
 /*
-Performs a Boundary Package-Merge step. Puts a new chain in the given list. The
-new chain is, depending on the weights, a leaf or a combination of two chains
-from the previous list.
-lists: The lists of chains.
-maxbits: Number of lists.
-leaves: The leaves, one per symbol.
-numsymbols: Number of leaves.
-pool: the node memory pool.
-index: The index of the list in which a new chain or leaf is required.
+Sorts the leaves by weight, from lightest to heaviest. The weights must be
+unique, so that the result does not depend on the sorting algorithm. This is a
+bottom-up merge sort, which is faster than qsort with a comparator callback for
+these small arrays. tmp must have room for n leaves.
 */
-static void BoundaryPM(Node* (*lists)[2], Node* leaves, int numsymbols,
-                       NodePool* pool, int index) {
-  Node* newchain;
-  Node* oldchain;
-  int lastcount = lists[index][1]->count;  /* Count of last chain of list. */
-
-  if (index == 0 && lastcount >= numsymbols) return;
-
-  newchain = pool->next++;
-  oldchain = lists[index][1];
-
-  /* These are set up before the recursive calls below, so that there is a list
-  pointing to the new node, to let the garbage collection know it's in use. */
-  lists[index][0] = oldchain;
-  lists[index][1] = newchain;
-
-  if (index == 0) {
-    /* New leaf node in list 0. */
-    InitNode(leaves[lastcount].weight, lastcount + 1, 0, newchain);
-  } else {
-    size_t sum = lists[index - 1][0]->weight + lists[index - 1][1]->weight;
-    if (lastcount < numsymbols && sum > leaves[lastcount].weight) {
-      /* New leaf inserted in list, so count is incremented. */
-      InitNode(leaves[lastcount].weight, lastcount + 1, oldchain->tail,
-          newchain);
-    } else {
-      InitNode(sum, lastcount, lists[index - 1][1], newchain);
-      /* Two lookahead chains of previous list used up, create new ones. */
-      BoundaryPM(lists, leaves, numsymbols, pool, index - 1);
-      BoundaryPM(lists, leaves, numsymbols, pool, index - 1);
+static void SortLeaves(Node* leaves, Node* tmp, int n) {
+  Node* src = leaves;
+  Node* dst = tmp;
+  int width, i;
+  /* Insertion sort runs of 8 first. */
+  for (i = 0; i < n; i += 8) {
+    int end = i + 8 < n ? i + 8 : n;
+    int a;
+    for (a = i + 1; a < end; a++) {
+      Node v = leaves[a];
+      int b = a;
+      while (b > i && leaves[b - 1].weight > v.weight) {
+        leaves[b] = leaves[b - 1];
+        b--;
+      }
+      leaves[b] = v;
     }
   }
-}
-
-static void BoundaryPMFinal(Node* (*lists)[2],
-    Node* leaves, int numsymbols, NodePool* pool, int index) {
-  int lastcount = lists[index][1]->count;  /* Count of last chain of list. */
-
-  size_t sum = lists[index - 1][0]->weight + lists[index - 1][1]->weight;
-
-  if (lastcount < numsymbols && sum > leaves[lastcount].weight) {
-    Node* newchain = pool->next;
-    Node* oldchain = lists[index][1]->tail;
-
-    lists[index][1] = newchain;
-    newchain->count = lastcount + 1;
-    newchain->tail = oldchain;
-  } else {
-    lists[index][1]->tail = lists[index - 1][1];
-  }
-}
-
-/*
-Initializes each list with as lookahead chains the two leaves with lowest
-weights.
-*/
-static void InitLists(
-    NodePool* pool, const Node* leaves, int maxbits, Node* (*lists)[2]) {
-  int i;
-  Node* node0 = pool->next++;
-  Node* node1 = pool->next++;
-  InitNode(leaves[0].weight, 1, 0, node0);
-  InitNode(leaves[1].weight, 2, 0, node1);
-  for (i = 0; i < maxbits; i++) {
-    lists[i][0] = node0;
-    lists[i][1] = node1;
-  }
-}
-
-/*
-Converts result of boundary package-merge to the bitlengths. The result in the
-last chain of the last list contains the amount of active leaves in each list.
-chain: Chain to extract the bit length from (last chain from last list).
-*/
-static void ExtractBitLengths(Node* chain, Node* leaves, unsigned* bitlengths) {
-  int counts[16] = {0};
-  unsigned end = 16;
-  unsigned ptr = 15;
-  unsigned value = 1;
-  Node* node;
-  int val;
-
-  for (node = chain; node; node = node->tail) {
-    counts[--end] = node->count;
-  }
-
-  val = counts[15];
-  while (ptr >= end) {
-    for (; val > counts[ptr - 1]; val--) {
-      bitlengths[leaves[val - 1].count] = value;
+  for (width = 8; width < n; width *= 2) {
+    Node* swap;
+    for (i = 0; i < n; i += 2 * width) {
+      int mid = i + width < n ? i + width : n;
+      int end = i + 2 * width < n ? i + 2 * width : n;
+      int a = i, b = mid, o = i;
+      while (a < mid && b < end) {
+        dst[o++] = src[b].weight < src[a].weight ? src[b++] : src[a++];
+      }
+      while (a < mid) dst[o++] = src[a++];
+      while (b < end) dst[o++] = src[b++];
     }
-    ptr--;
-    value++;
+    swap = src;
+    src = dst;
+    dst = swap;
   }
-}
-
-/*
-Comparator for sorting the leaves. Has the function signature for qsort.
-*/
-static int LeafComparator(const void* a, const void* b) {
-  return ((const Node*)a)->weight - ((const Node*)b)->weight;
+  if (src != leaves) {
+    for (i = 0; i < n; i++) leaves[i] = src[i];
+  }
 }
 
 int ZopfliLengthLimitedCodeLengths(
     const size_t* frequencies, int n, int maxbits, unsigned* bitlengths) {
-  NodePool pool;
   int i;
   int numsymbols = 0;  /* Amount of symbols with frequency > 0. */
-  int numBoundaryPMRuns;
-  Node* nodes;
 
-  /* Array of lists of chains. Each list requires only two lookahead chains at
-  a time, so each list is a array of two Node*'s. */
-  Node* (*lists)[2];
-
-  /* One leaf per symbol. Only numsymbols leaves will be used. */
-  Node* leaves = (Node*)malloc(n * sizeof(*leaves));
+  /* One leaf per symbol. Only numsymbols leaves will be used. The second half
+  is scratch space for sorting. */
+  Node localleaves[2 * SMALL_ALPHABET];
+  Node* leaves = n <= SMALL_ALPHABET ? localleaves
+      : (Node*)malloc(2 * n * sizeof(*leaves));
 
   /* Initialize all bitlengths at 0. */
   for (i = 0; i < n; i++) {
@@ -200,22 +229,22 @@ int ZopfliLengthLimitedCodeLengths(
 
   /* Check special cases and error conditions. */
   if ((1 << maxbits) < numsymbols) {
-    free(leaves);
+    if (leaves != localleaves) free(leaves);
     return 1;  /* Error, too few maxbits to represent symbols. */
   }
   if (numsymbols == 0) {
-    free(leaves);
+    if (leaves != localleaves) free(leaves);
     return 0;  /* No symbols at all. OK. */
   }
   if (numsymbols == 1) {
     bitlengths[leaves[0].count] = 1;
-    free(leaves);
+    if (leaves != localleaves) free(leaves);
     return 0;  /* Only one symbol, give it bitlength 1, not 0. OK. */
   }
   if (numsymbols == 2) {
     bitlengths[leaves[0].count]++;
     bitlengths[leaves[1].count]++;
-    free(leaves);
+    if (leaves != localleaves) free(leaves);
     return 0;
   }
 
@@ -224,12 +253,12 @@ int ZopfliLengthLimitedCodeLengths(
   for (i = 0; i < numsymbols; i++) {
     if (leaves[i].weight >=
         ((size_t)1 << (sizeof(leaves[0].weight) * CHAR_BIT - 9))) {
-      free(leaves);
+      if (leaves != localleaves) free(leaves);
       return 1;  /* Error, we need 9 bits for the count. */
     }
     leaves[i].weight = (leaves[i].weight << 9) | leaves[i].count;
   }
-  qsort(leaves, numsymbols, sizeof(Node), LeafComparator);
+  SortLeaves(leaves, leaves + numsymbols, numsymbols);
   for (i = 0; i < numsymbols; i++) {
     leaves[i].weight >>= 9;
   }
@@ -238,25 +267,8 @@ int ZopfliLengthLimitedCodeLengths(
     maxbits = numsymbols - 1;
   }
 
-  /* Initialize node memory pool. */
-  nodes = (Node*)malloc(maxbits * 2 * numsymbols * sizeof(Node));
-  pool.next = nodes;
+  PackageMerge(leaves, numsymbols, maxbits, bitlengths);
 
-  lists = (Node* (*)[2])malloc(maxbits * sizeof(*lists));
-  InitLists(&pool, leaves, maxbits, lists);
-
-  /* In the last list, 2 * numsymbols - 2 active chains need to be created. Two
-  are already created in the initialization. Each BoundaryPM run creates one. */
-  numBoundaryPMRuns = 2 * numsymbols - 4;
-  for (i = 0; i < numBoundaryPMRuns - 1; i++) {
-    BoundaryPM(lists, leaves, numsymbols, &pool, maxbits - 1);
-  }
-  BoundaryPMFinal(lists, leaves, numsymbols, &pool, maxbits - 1);
-
-  ExtractBitLengths(lists[maxbits - 1][1], leaves, bitlengths);
-
-  free(lists);
-  free(leaves);
-  free(nodes);
+  if (leaves != localleaves) free(leaves);
   return 0;  /* OK. */
 }

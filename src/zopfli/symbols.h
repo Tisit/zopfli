@@ -34,11 +34,25 @@ Utilities for using the lz77 symbols of the deflate spec.
 # define ZOPFLI_HAS_BUILTIN_CLZ
 #endif
 
+#ifdef ZOPFLI_HAS_BUILTIN_CLZ
+# define ZOPFLI_CLZ(x) __builtin_clz(x)
+#elif defined(_MSC_VER)
+/* MSVC: use the bit scan intrinsic instead of the long comparison chains. */
+# include <intrin.h>
+# define ZOPFLI_HAS_BUILTIN_CLZ
+static int ZopfliClzMsvc(unsigned x) {
+  unsigned long index;
+  _BitScanReverse(&index, x);
+  return 31 ^ (int)index;
+}
+# define ZOPFLI_CLZ(x) ZopfliClzMsvc(x)
+#endif
+
 /* Gets the amount of extra bits for the given dist, cfr. the DEFLATE spec. */
 static int ZopfliGetDistExtraBits(int dist) {
 #ifdef ZOPFLI_HAS_BUILTIN_CLZ
   if (dist < 5) return 0;
-  return (31 ^ __builtin_clz(dist - 1)) - 1; /* log2(dist - 1) - 1 */
+  return (31 ^ ZOPFLI_CLZ(dist - 1)) - 1; /* log2(dist - 1) - 1 */
 #else
   if (dist < 5) return 0;
   else if (dist < 9) return 1;
@@ -63,7 +77,7 @@ static int ZopfliGetDistExtraBitsValue(int dist) {
   if (dist < 5) {
     return 0;
   } else {
-    int l = 31 ^ __builtin_clz(dist - 1); /* log2(dist - 1) */
+    int l = 31 ^ ZOPFLI_CLZ(dist - 1); /* log2(dist - 1) */
     return (dist - (1 + (1 << l))) & ((1 << (l - 1)) - 1);
   }
 #else
@@ -90,7 +104,7 @@ static int ZopfliGetDistSymbol(int dist) {
   if (dist < 5) {
     return dist - 1;
   } else {
-    int l = (31 ^ __builtin_clz(dist - 1)); /* log2(dist - 1) */
+    int l = (31 ^ ZOPFLI_CLZ(dist - 1)); /* log2(dist - 1) */
     int r = ((dist - 1) >> (l - 1)) & 1;
     return l * 2 + r;
   }

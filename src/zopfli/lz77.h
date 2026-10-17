@@ -39,6 +39,7 @@ no dist and the corresponding litlens value is a literal instead of a length.
 Parameter size: The size of both the litlens and dists arrays.
 The memory can best be managed by using ZopfliInitLZ77Store to initialize it,
 ZopfliCleanLZ77Store to destroy it, and ZopfliStoreLitLenDist to append values.
+ZopfliClearLZ77Store empties it but keeps the memory for reuse.
 
 */
 typedef struct ZopfliLZ77Store {
@@ -59,10 +60,14 @@ typedef struct ZopfliLZ77Store {
   looping through the actual symbols of this chunk. */
   size_t* ll_counts;
   size_t* d_counts;
+
+  /* Amount of LZ77 symbols the arrays have room for. */
+  size_t capacity;
 } ZopfliLZ77Store;
 
 void ZopfliInitLZ77Store(const unsigned char* data, ZopfliLZ77Store* store);
 void ZopfliCleanLZ77Store(ZopfliLZ77Store* store);
+void ZopfliClearLZ77Store(ZopfliLZ77Store* store);
 void ZopfliCopyLZ77Store(const ZopfliLZ77Store* source, ZopfliLZ77Store* dest);
 void ZopfliStoreLitLenDist(unsigned short length, unsigned short dist,
                            size_t pos, ZopfliLZ77Store* store);
